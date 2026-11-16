@@ -1,5 +1,5 @@
 import { CheerioAPI, load as parseHTML } from 'cheerio';
-import { fetchApi } from '@libs/fetch';
+import { fetchApi, type FetchInit } from '@libs/fetch';
 import { FilterTypes, Filters } from '@libs/filterInputs';
 import { NovelStatus } from '@libs/novelStatus';
 import { Plugin } from '@/types/plugin';
@@ -25,7 +25,41 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
   name = 'Scribble Hub';
   icon = 'src/en/scribblehub/icon.png';
   site = 'https://www.scribblehub.com/';
-  version = '1.1.0';
+  version = '1.1.1';
+
+  // LNReader 2.1.4 uses native fetch, not the WebView's browser requests.
+  // Request HTML explicitly and retain the app's User-Agent for its cookies.
+  async fetchHtml(url: string, init?: FetchInit): Promise<string> {
+    const response = await fetchApi(url, {
+      ...init,
+      headers: {
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Mode': init?.method === 'POST' ? 'cors' : 'navigate',
+        'Sec-Fetch-Dest': init?.method === 'POST' ? 'empty' : 'document',
+        Referer: this.site,
+        ...init?.headers,
+      },
+    });
+    const html = await response.text();
+    const blocked =
+      response.headers.get('cf-mitigated') === 'challenge' ||
+      /<title[^>]*>\s*(?:Just a moment|Attention Required)/i.test(html) ||
+      /id=["']challenge-form["']/i.test(html);
+
+    if (blocked || !response.ok) {
+      throw Object.assign(
+        new Error(
+          blocked || response.status === 403 || response.status === 503
+            ? 'Scribble Hub blocked the request. In WebView, use the website menu: Read > Series Finder, then return and retry. The homepage alone may still load normally.'
+            : `Scribble Hub request failed (HTTP ${response.status}).`,
+        ),
+        { response },
+      );
+    }
+    return html;
+  }
 
   parseReleaseTime(dateText: string): string | null {
     const relative = dateText.match(
@@ -59,10 +93,20 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
   }
 
   parseNovels(loadedCheerio: CheerioAPI) {
+    // A redirect to the homepage is not a successful empty search. Keep genuine
+    // empty searches and exhausted pagination valid on the listing pages.
+    if (!loadedCheerio('.search_main_box, #rankfilter').length) {
+      throw new Error(
+        'Scribble Hub returned an unexpected page instead of a novel list. Open Read > Series Finder in WebView and retry.',
+      );
+    }
     const novels: Plugin.NovelItem[] = [];
 
     loadedCheerio('.search_main_box').each((i, el) => {
-      const novelName = loadedCheerio(el).find('.search_title > a').text();
+      const novelName = loadedCheerio(el)
+        .find('.search_title > a')
+        .text()
+        .trim();
       const novelCover = loadedCheerio(el)
         .find('.search_img > img')
         .attr('src');
@@ -125,7 +169,7 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
       url += `series-finder/?sf=1&sort=pageviews&order=desc&pg=${page}`;
     }
 
-    const body = await fetchApi(url).then(result => result.text());
+    const body = await this.fetchHtml(url);
 
     const loadedCheerio = parseHTML(body);
     return this.parseNovels(loadedCheerio);
@@ -160,7 +204,7 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
     const novelId = loadedCheerio('input#mypostid').attr('value');
     if (!novelId) return [];
 
-    const result = await fetchApi(`${this.site}wp-admin/admin-ajax.php`, {
+    const html = await this.fetchHtml(`${this.site}wp-admin/admin-ajax.php`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -175,14 +219,11 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
       }).toString(),
     });
 
-    if (!result.ok) return [];
-
-    return this.parseTocChapters(parseHTML(await result.text()));
+    return this.parseTocChapters(parseHTML(html));
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
-    const result = await fetchApi(this.site + novelPath);
-    const body = await result.text();
+    const body = await this.fetchHtml(this.site + novelPath);
 
     const loadedCheerio = parseHTML(body);
 
@@ -228,8 +269,7 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const result = await fetchApi(this.site + chapterPath);
-    const body = await result.text();
+    const body = await this.fetchHtml(this.site + chapterPath);
 
     const loadedCheerio = parseHTML(body);
 
@@ -242,8 +282,7 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
     const url = `${this.site}series-finder/?sf=1&sh=${encodeURIComponent(searchTerm)}&pg=${pageNo}`;
-    const result = await fetchApi(url);
-    const body = await result.text();
+    const body = await this.fetchHtml(url);
 
     const loadedCheerio = parseHTML(body);
     return this.parseNovels(loadedCheerio);
